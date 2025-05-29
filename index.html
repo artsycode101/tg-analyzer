@@ -283,6 +283,8 @@
                 </div>
             </div>
 
+
+
             <div class="control-group">
                 <label for="exceptions">Card Exceptions (format: "Card Name|Edition" one per line)</label>
                 <textarea id="exceptions" placeholder="Example:&#10;Lightning Bolt|Alpha&#10;Black Lotus|Beta&#10;Time Walk|Unlimited"></textarea>
@@ -322,33 +324,155 @@
         async function downloadAndParseZip(url, fileName) {
             showStatus(`Downloading ${fileName}...`);
             
-            try {
-                const response = await fetch(url);
-                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-                
-                const arrayBuffer = await response.arrayBuffer();
-                const zip = new JSZip();
-                const zipContent = await zip.loadAsync(arrayBuffer);
-                
-                const csvFile = Object.keys(zipContent.files)[0];
-                const csvContent = await zipContent.files[csvFile].async('text');
-                
-                return new Promise((resolve, reject) => {
-                    Papa.parse(csvContent, {
-                        header: true,
-                        dynamicTyping: true,
-                        skipEmptyLines: true,
-                        complete: (results) => {
-                            if (results.errors.length > 0) {
-                                console.warn('Parse warnings:', results.errors);
-                            }
-                            resolve(results.data);
+            // Try multiple methods to fetch the data
+            const proxies = [
+                '', // Direct fetch first
+                'https://api.allorigins.win/raw?url=',
+                'https://cors-anywhere.herokuapp.com/',
+                'https://api.codetabs.com/v1/proxy?quest='
+            ];
+            
+            for (let i = 0; i < proxies.length; i++) {
+                try {
+                    const proxyUrl = proxies[i] + encodeURIComponent(url);
+                    const finalUrl = i === 0 ? url : proxyUrl;
+                    
+                    showStatus(`Downloading ${fileName}... (attempt ${i + 1}/${proxies.length})`);
+                    
+                    const response = await fetch(finalUrl, {
+                        method: 'GET',
+                        headers: {
+                            'Accept': 'application/zip, application/octet-stream, */*',
                         },
-                        error: reject
+                        mode: 'cors'
                     });
-                });
-            } catch (error) {
-                throw new Error(`Failed to download/parse ${fileName}: ${error.message}`);
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    
+                    const arrayBuffer = await response.arrayBuffer();
+                    
+                    if (arrayBuffer.byteLength === 0) {
+                        throw new Error('Downloaded file is empty');
+                    }
+                    
+                    const zip = new JSZip();
+                    const zipContent = await zip.loadAsync(arrayBuffer);
+                    
+                    // List all files in the zip for debugging
+                    const allFiles = Object.keys(zipContent.files);
+                    console.log(`Files in ${fileName} zip:`, allFiles);
+                    
+                    // Look for any text files (not just .csv)
+                    const textFiles = allFiles.filter(name => {
+                        const file = zipContent.files[name];
+                        return !file.dir && (
+                            name.toLowerCase().endsWith('.csv') ||
+                            name.toLowerCase().endsWith('.txt') ||
+                            name.toLowerCase().endsWith('.tsv') ||
+                            !name.includes('.') || // Files without extension
+                            name.toLowerCase().includes('card') ||
+                            name.toLowerCase().includes('price')
+                        );
+                    });
+                    
+                    console.log(`Text files found in ${fileName}:`, textFiles);
+                    
+                    if (textFiles.length === 0) {
+                        // If no obvious files, try the first non-directory file
+                        const nonDirFiles = allFiles.filter(name => !zipContent.files[name].dir);
+                        if (nonDirFiles.length > 0) {
+                            textFiles.push(nonDirFiles[0]);
+                            console.log(`Using first available file: ${nonDirFiles[0]}`);
+                        } else {
+                            throw new Error(`No readable files found in zip archive. Files present: ${allFiles.join(', ')}`);
+                        }
+                    }
+                    
+                    const targetFile = textFiles[0];
+                    const fileContent = await zipContent.files[targetFile].async('text');
+                    
+                    // Log first few lines to understand the format
+                    const firstLines = fileContent.split('\n').slice(0, 3);
+                    console.log(`First few lines of ${targetFile}:`, firstLines);
+                    
+                    return new Promise((resolve, reject) => {
+                        // Try different delimiters
+                        const delimiters = [',', '\t', ';', '|'];
+                        
+                        function tryParse(delimiterIndex = 0) {
+                            if (delimiterIndex >= delimiters.length) {
+                                reject(new Error('Unable to parse file with any common delimiter'));
+                                return;
+                            }
+                            
+                            Papa.parse(fileContent, {
+                                header: true,
+                                dynamicTyping: true,
+                                skipEmptyLines: true,
+                                delimiter: delimiters[delimiterIndex],
+                                complete: (results) => {
+                                    console.log(`Parse attempt with delimiter '${delimiters[delimiterIndex]}':`, {
+                                        rows: results.data.length,
+                                        columns: results.data[0] ? Object.keys(results.data[0]).length : 0,
+                                        firstRow: results.data[0],
+                                        errors: results.errors.length
+                                    });
+                                    
+                                    if (results.errors.length > 0) {
+                                        console.warn('Parse warnings:', results.errors);
+                                    }
+                                    
+                                    if (!results.data || results.data.length === 0) {
+                                        tryParse(delimiterIndex + 1);
+                                        return;
+                                    }
+                                    
+                                    // Check if we have meaningful data
+                                    const firstRow = results.data[0];
+                                    const columnCount = firstRow ? Object.keys(firstRow).length : 0;
+                                    
+                                    if (columnCount < 2) {
+                                        tryParse(delimiterIndex + 1);
+                                        return;
+                                    }
+                                    
+                                    resolve(results.data);
+                                },
+                                error: (error) => {
+                                    console.warn(`Parse error with delimiter '${delimiters[delimiterIndex]}':`, error);
+                                    tryParse(delimiterIndex + 1);
+                                }
+                            });
+                        }
+                        
+                        tryParse();
+                    });
+                    
+                } catch (error) {
+                    console.warn(`Attempt ${i + 1} failed:`, error.message);
+                    
+                    if (i === proxies.length - 1) {
+                        // If all methods failed, provide detailed error message
+                        let errorMessage = `Failed to download/parse ${fileName}. `;
+                        
+                        if (error.message.includes('Failed to fetch') || error.message.includes('CORS')) {
+                            errorMessage += 'This appears to be a CORS (Cross-Origin) issue. ';
+                            errorMessage += 'Try: 1) Use a different browser, 2) Disable browser security temporarily, ';
+                            errorMessage += '3) Use a browser extension like CORS Unblock, or 4) Deploy to a server with proxy support.';
+                        } else if (error.message.includes('HTTP error')) {
+                            errorMessage += 'The server returned an error. The data source might be temporarily unavailable.';
+                        } else {
+                            errorMessage += `Error: ${error.message}`;
+                        }
+                        
+                        throw new Error(errorMessage);
+                    }
+                    
+                    // Wait a bit before trying the next method
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
             }
         }
 
